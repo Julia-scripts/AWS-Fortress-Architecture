@@ -33,7 +33,7 @@ Resources:
     Properties:
       VpcId: !Ref FortressVPC
       CidrBlock: 10.0.2.0/24
-      AvailabilityZone: !Select [0, !GetAZs ""]
+      AvailabilityZone: !Select [1, !GetAZs ""]
 
   # --- GATEWAYS & ROUTING ---
   InternetGateway:
