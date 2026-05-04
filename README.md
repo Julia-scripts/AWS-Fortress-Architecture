@@ -1,3 +1,5 @@
+[Architecture Diagram](architecture-diagram.png)
+
 # AWS-Fortress-Architecture
 AWS CloudFortress: A Zero-Trust IaC "Bank Vault" architecture. Features WAF protection against OWASP Top 10 (SQLi/XSS), private subnet isolation for EC2, and Client VPN for encrypted management. Replaces risky Bastion Hosts with automated, multi-layered defense to secure sensitive FinTech or Healthcare data.
 Got it. Here is the clean, professional, and copy-paste-ready `README.md` content. I’ve balanced the technical "buzzwords" that recruiters look for with the "Super Fortress" story we built.
