@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS CloudFortress: Secure VPC with WAF, ALB, and Client VPN (Zero-Trust Architecture)'
+
+# --- PARAMETERS: These allow users to fork your repo and use their own certs ---
+Parameters:
+  ClientCertArn:
+    Type: String
+    Description: "The ARN of the Client Certificate in ACM (from setup-guide.md)"
+  ServerCertArn:
+    Type: String
+    Description: "The ARN of the Server Certificate in ACM (from setup-guide.md)"
+
+Resources:
+  # --- VPC & NETWORKING ---
+  FortressVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: Fortress-VPC}]
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FortressVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref FortressVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  # --- GATEWAYS & ROUTING ---
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref FortressVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+
+  NATGateway:
+    Type: AWS::EC2::NATGateway
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref FortressVPC }
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref FortressVPC }
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PublicSubnetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet, RouteTableId: !Ref PublicRouteTable }
+
+  PrivateSubnetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet, RouteTableId: !Ref PrivateRouteTable }
+
+  # --- SECURITY: WAF (OWASP TOP 10 PROTECTION) ---
+  FortressWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: FortressWebShield
+      Scope: REGIONAL
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: FortressWebACL
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 0
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet # This blocks SQLi and XSS
+          OverrideAction: { None: {} }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSetMetric
+
+  # --- SECURITY GROUPS ---
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow Public HTTP (Port 80)"
+      VpcId: !Ref FortressVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow traffic only from ALB and VPN"
+      VpcId: !Ref FortressVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 172.16.0.0/22 # Only accessible via VPN
+
+  # --- LOAD BALANCER & WAF ASSOCIATION ---
+  FortressALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets: [!Ref PublicSubnet, !Ref PrivateSubnet]
+      SecurityGroups: [!Ref ALBSecurityGroup]
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref FortressALB
+      Port: 80
+      Protocol: HTTP
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref FortressVPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      Targets:
+        - Id: !Ref FortressServer
+
+  WAFAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref FortressALB
+      WebACLArn: !GetAtt FortressWebACL.Arn
+
+  # --- COMPUTE & VPN ---
+  FortressServer:
+    Type: AWS::EC2::Instance
+    DependsOn: PrivateRoute
+    Properties:
+      InstanceType: t3.micro
+      ImageId: ami-07146059d280e227a # Amazon Linux 2023 (Verify for your region)
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds: [!Ref AppSecurityGroup]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          echo "<h1>Fortress V3: SQLi and XSS Protected Bank Vault</h1>" > /var/www/html/index.html
+
+  ClientVpnEndpoint:
+    Type: AWS::EC2::ClientVpnEndpoint
+    Properties:
+      Description: "Secure VPN Access to Private Subnet"
+      AuthenticationOptions:
+        - Type: certificate-authentication
+          MutualAuthentication:
+            ClientRootCertificateChainArn: !Ref ClientCertArn
+      ServerCertificateArn: !Ref ServerCertArn
+      ClientCidrBlock: 172.16.0.0/22
+      ConnectionLogOptions: { Enabled: false }
+      VpcId: !Ref FortressVPC
+
+  VpnSubnetAssociation:
+    Type: AWS::EC2::ClientVpnTargetNetworkAssociation
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVpnEndpoint
+      SubnetId: !Ref PrivateSubnet
+
+  VpnAuthorizationRule:
+    Type: AWS::EC2::ClientVpnAuthorizationRule
+    Properties:
+      ClientVpnEndpointId: !Ref ClientVpnEndpoint
+      TargetNetworkCidr: 10.0.0.0/16
+      AuthorizeAllGroups: true
+
+Outputs:
+  WebsiteURL:
+    Description: "URL to access the secure fortress"
+    Value: !GetAtt FortressALB.DNSName
